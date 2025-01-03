@@ -48,10 +48,27 @@ class SelfAttention(nn.Module):
         return self.out(context)
 
 
+class MLP(nn.Module):
+    def __init__(self, emb_dim, ff_int_dim_mult):
+        self.in_ff = nn.Linear(emb_dim, emb_dim * ff_int_dim_mult)
+        self.out_ff = nn.Linear(emb_dim * ff_int_dim_mult, emb_dim)
+
+        self.layers = nn.Sequential(
+            self.in_ff,
+            nn.GELU(),
+            self.out_ff
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
+
 
 class Transformer(nn.Module):
     def __init__(self, context_length, emb_dim, ff_int_dim_mult, n_heads, drop_rate, qkv_bias):
         super(Transformer, self).__init__()
+
+        self.ln_1 = nn.LayerNorm((context_length, emb_dim))
 
         self.attention = SelfAttention(
             masked=True,
@@ -61,7 +78,33 @@ class Transformer(nn.Module):
             drop_rate=drop_rate,
             qkv_bias=qkv_bias
         )
-        self.ff1 = nn.Linear()
+
+        self.dropout_1 = nn.Dropout(drop_rate)
+
+        self.ln_2 = nn.LayerNorm((context_length, emb_dim))
+
+        self.MLP = MLP(emb_dim, ff_int_dim_mult)
+
+        self.dropout_2 = nn.Dropout(drop_rate)
+
+    def forward(self, x):
+        orig = x
+
+        x = self.ln_1(x)
+        x = self.attention(x)
+        x = self.dropout_1(x)
+
+        x = x + orig
+
+        orig = x
+
+        x = self.ln_2(x)
+        x = self.MLP
+        x = self.dropout_2(x)
+
+        x = x + orig
+
+        return x
 
 
 class GPT(nn.Module):
@@ -69,7 +112,8 @@ class GPT(nn.Module):
         super(GPT, self).__init__()
 
         self.embedding = nn.Embedding(num_embeddings=vocab_size, embedding_dim=emb_dim)
-        self.positional_embedding = None  # TODO
+        self.positional_embedding = nn.Embedding(context_length, emb_dim)
+        self.dropout = nn.Dropout(drop_rate)
 
         self.transformers = nn.Sequential(
             [
@@ -84,7 +128,22 @@ class GPT(nn.Module):
             ] * n_layers
         )
 
+        self.ln = nn.LayerNorm()
         self.output = nn.Linear(emb_dim, vocab_size, bias=False)
+
+    def forward(self, x):
+        batches, context_length = x.shape
+
+        token_embeddings = self.embedding(x)
+        positional_embeddings = self.positional_embedding(torch.arange(context_length))
+
+        embeddings = token_embeddings + positional_embeddings
+
+        x = self.dropout(embeddings)
+        x = self.transformers(x)
+        x = self.ln(x)
+        
+        return self.output(x)
 
 
 def train_gpt(config):
