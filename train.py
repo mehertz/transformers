@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import math
+import tiktoken
 import argparse
 
 
@@ -13,17 +14,18 @@ class SelfAttention(nn.Module):
         self.emb_dim = emb_dim
         self.masked = masked
 
-        self.q_mat = nn.Linear(emb_dim, emb_dim)
-        self.k_mat = nn.Linear(emb_dim, emb_dim)
-        self.v_mat = nn.Linear(emb_dim, emb_dim)
+        self.q_mat = nn.Linear(emb_dim, emb_dim, bias=qkv_bias)
+        self.k_mat = nn.Linear(emb_dim, emb_dim, bias=qkv_bias)
+        self.v_mat = nn.Linear(emb_dim, emb_dim, bias=qkv_bias)
 
         self.out = nn.Linear(emb_dim, emb_dim)
 
         self.dropout = nn.Dropout(drop_rate)
 
-        self.mask = torch.triu(
-            torch.ones(context_length, context_length), diagonal=1
-        ).bool()
+        self.register_buffer(
+            "mask",
+            torch.triu(torch.ones(context_length, context_length), diagonal=1).bool()
+        )
 
     def forward(self, x):
         Q = self.q_mat(x)
@@ -36,10 +38,10 @@ class SelfAttention(nn.Module):
         Ks = K.view(batches, tokens, self.n_heads, dims // self.n_heads).transpose(1,2)
         Vs = V.view(batches, tokens, self.n_heads, dims // self.n_heads).transpose(1,2)
 
-        attn_scores = Qs @ Ks.transpose(2, 3) / ((dims // self.n_heads) ** 0.5)
+        attn_scores = (Qs @ Ks.transpose(2, 3)) / ((dims // self.n_heads) ** 0.5)
 
         if self.masked:
-            attn_scores.masked_fill_(self.mask, -float('inf'))
+            attn_scores.masked_fill_(self.mask[:tokens, :tokens], -float('inf'))
 
         attn_weights = self.dropout(torch.softmax(attn_scores, dim=3)) @ Vs
 
@@ -50,6 +52,8 @@ class SelfAttention(nn.Module):
 
 class MLP(nn.Module):
     def __init__(self, emb_dim, ff_int_dim_mult):
+        super(MLP, self).__init__()
+
         self.in_ff = nn.Linear(emb_dim, emb_dim * ff_int_dim_mult)
         self.out_ff = nn.Linear(emb_dim * ff_int_dim_mult, emb_dim)
 
@@ -63,12 +67,11 @@ class MLP(nn.Module):
         return self.layers(x)
 
 
-
 class Transformer(nn.Module):
     def __init__(self, context_length, emb_dim, ff_int_dim_mult, n_heads, drop_rate, qkv_bias):
         super(Transformer, self).__init__()
 
-        self.ln_1 = nn.LayerNorm((context_length, emb_dim))
+        self.ln_1 = nn.LayerNorm(emb_dim)
 
         self.attention = SelfAttention(
             masked=True,
@@ -81,7 +84,7 @@ class Transformer(nn.Module):
 
         self.dropout_1 = nn.Dropout(drop_rate)
 
-        self.ln_2 = nn.LayerNorm((context_length, emb_dim))
+        self.ln_2 = nn.LayerNorm(emb_dim)
 
         self.MLP = MLP(emb_dim, ff_int_dim_mult)
 
@@ -99,7 +102,7 @@ class Transformer(nn.Module):
         orig = x
 
         x = self.ln_2(x)
-        x = self.MLP
+        x = self.MLP(x)
         x = self.dropout_2(x)
 
         x = x + orig
@@ -114,9 +117,9 @@ class GPT(nn.Module):
         self.embedding = nn.Embedding(num_embeddings=vocab_size, embedding_dim=emb_dim)
         self.positional_embedding = nn.Embedding(context_length, emb_dim)
         self.dropout = nn.Dropout(drop_rate)
-
+        
         self.transformers = nn.Sequential(
-            [
+            *[
                 Transformer(
                     context_length=context_length, 
                     emb_dim=emb_dim, 
@@ -125,10 +128,11 @@ class GPT(nn.Module):
                     drop_rate=drop_rate,
                     qkv_bias=qkv_bias
                 ) 
-            ] * n_layers
+                for _ in range(n_layers)
+            ]
         )
 
-        self.ln = nn.LayerNorm()
+        self.ln = nn.LayerNorm(emb_dim)
         self.output = nn.Linear(emb_dim, vocab_size, bias=False)
 
     def forward(self, x):
@@ -150,6 +154,23 @@ def train_gpt(config):
     # Define the GPT model
     model = GPT(config)
 
+
+def inference(gpt: GPT, text: str, max_tokens_out: int):
+    tokenizer = tiktoken.get_encoding("gpt2")
+    tokens = torch.tensor(tokenizer.encode(text)).unsqueeze(0)
+
+    gpt.eval()
+    with torch.no_grad():
+        for _ in range(max_tokens_out):
+            logits = gpt(tokens)
+
+            idx = torch.argmax(logits[:, -1, :])
+            # sofmaxed = torch.nn.functional.softmax(logits)
+            # _, idx = torch.max(sofmaxed)
+
+            tokens = torch.cat((tokens, torch.tensor([idx]).unsqueeze(0)), dim=1)
+
+    return tokenizer.decode(tokens[0].tolist())
 
 
 if __name__ == "__main__":
