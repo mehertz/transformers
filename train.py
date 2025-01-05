@@ -150,6 +150,18 @@ class GPT(nn.Module):
         return self.output(x)
 
 
+class CrossEntropyLoss(nn.Module):
+    super().__init__()
+
+    def forward(self, input_logits, target_idxs):
+        # input logits: minibatch x vocab
+        # target idxs: minibatch
+        input_probs = torch.nn.functional.softmax(input_logits, dim=1)
+        target_probs = input_probs[torch.arange(len(input_probs)), target_idxs]
+
+        return torch.mean(torch.sum(torch.log(target_probs))) * -1
+
+
 def train_gpt(config):
     # Define the GPT model
     model = GPT(config)
