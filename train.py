@@ -156,10 +156,17 @@ class CrossEntropyLoss(nn.Module):
     def forward(self, input_logits, target_idxs):
         # input logits: minibatch x vocab
         # target idxs: minibatch
-        input_probs = torch.nn.functional.softmax(input_logits, dim=1)
-        target_probs = input_probs[torch.arange(len(input_probs)), target_idxs]
+        # input_probs = torch.nn.functional.softmax(input_logits, dim=1)
+        # target_probs = input_probs[torch.arange(len(input_probs)), target_idxs]
 
-        return torch.mean(torch.sum(torch.log(target_probs))) * -1
+        # return torch.mean(torch.sum(torch.log(target_probs))) * -1
+
+        # --- Alright Claude, let's use log_softmax and gather as you describe!
+
+        target_probs = nn.functional.log_softmax(input_logits, dim=1)
+        target_probs = torch.gather(target_probs, dim=1, index=torch.unsqueeze(target_idxs, 1)).squeeze(1)
+
+        return torch.mean(target_probs)
 
 
 def train_gpt(config):
