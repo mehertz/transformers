@@ -7,6 +7,8 @@ import argparse
 import torch.utils
 import torch.utils.data
 
+from torch.utils.data import DataLoader
+
 
 class SelfAttention(nn.Module):
     def __init__(self, masked, context_length, emb_dim, n_heads, qkv_bias, drop_rate):
@@ -30,7 +32,7 @@ class SelfAttention(nn.Module):
             torch.triu(torch.ones(context_length, context_length), diagonal=1).bool()
         )
 
-    def forward(self, x, padding_masks=None):
+    def forward(self, x):
         Q = self.q_mat(x)
         K = self.k_mat(x)
         V = self.v_mat(x)
@@ -45,9 +47,6 @@ class SelfAttention(nn.Module):
 
         if self.masked:
             attn_scores.masked_fill_(self.mask[:tokens, :tokens], -float('inf'))
-
-        if padding_masks is not None:
-            attn_scores = attn_scores.masked_fill_(~padding_masks.unsqueeze(1), -float('inf'))
 
         attn_weights = self.dropout(torch.softmax(attn_scores, dim=3)) @ Vs
 
@@ -96,11 +95,11 @@ class Transformer(nn.Module):
 
         self.dropout_2 = nn.Dropout(drop_rate)
 
-    def forward(self, x, padding_masks=None):
+    def forward(self, x):
         orig = x
 
         x = self.ln_1(x)
-        x = self.attention(x, padding_masks=padding_masks)
+        x = self.attention(x)
         x = self.dropout_1(x)
 
         x = x + orig
@@ -122,9 +121,9 @@ class TransformerStack(nn.Module):
 
         self.layers = nn.ModuleList([Transformer(**transformer_kwargs) for _ in range(n_layers)])
 
-    def forward(self, x, padding_masks=None):
+    def forward(self, x):
         for layer in self.layers:
-            x = layer(x, padding_masks)
+            x = layer(x)
 
         return x
 
@@ -150,7 +149,7 @@ class GPT(nn.Module):
         self.ln = nn.LayerNorm(emb_dim)
         self.output = nn.Linear(emb_dim, vocab_size, bias=False)
 
-    def forward(self, x, padding_masks=None):
+    def forward(self, x):
         batches, context_length = x.shape
 
         token_embeddings = self.embedding(x)
@@ -159,7 +158,7 @@ class GPT(nn.Module):
         embeddings = token_embeddings + positional_embeddings
 
         x = self.dropout(embeddings)
-        x = self.transformers(x, padding_masks=padding_masks)
+        x = self.transformers(x)
         x = self.ln(x)
         
         return self.output(x)
@@ -178,10 +177,11 @@ class CrossEntropyLoss(nn.Module):
 
 
 class TinyStoriesDataset(torch.utils.data.Dataset):
-    def __init__(self, path: str, max_length: int, tokenizer, start_story_idx: int = 0, end_story_idx: int = None):
+    def __init__(self, path: str, max_length: int, tokenizer, start_story_idx: int = 0, end_story_idx: int = None, padding_token=-100):
         self.max_length = max_length
         self.input_sequences = []
         self.target_sequences = []
+        self.paddings_added = torch.tensor([], dtype=torch.int)
         
         # Read and split the file into stories
         with open(path, 'r') as f:
@@ -194,7 +194,12 @@ class TinyStoriesDataset(torch.utils.data.Dataset):
             tokens = tokenizer.encode(story.strip())
 
             for start_idx in range(0, max((len(tokens) - max_length) + 1, 1), max_length):
-                self.input_sequences.append(torch.tensor(tokens[start_idx : start_idx + max_length]))
+                input_seq = torch.tensor(tokens[start_idx : start_idx + max_length])
+                padding_quantity = max_length - len(input_seq)
+                input_seq = torch.cat((input_seq, torch.tensor([padding_token] * padding_quantity, dtype=input_seq.dtype)))
+                self.paddings_added = torch.cat((self.paddings_added, torch.tensor([padding_quantity], dtype=input_seq.dtype)))
+
+                self.input_sequences.append(input_seq)
 
                 _target_window_start = start_idx + 1
                 _target_window_end = _target_window_start + max_length
@@ -203,6 +208,7 @@ class TinyStoriesDataset(torch.utils.data.Dataset):
                 _is_end_of_sequence = len(_target_window) < max_length
 
                 _target_window_tokens = _target_window if not _is_end_of_sequence else torch.cat([_target_window, _eos_token])
+                _target_window_tokens = torch.cat((_target_window_tokens, torch.tensor([padding_token] * padding_quantity, dtype=input_seq.dtype)))
 
                 self.target_sequences.append(_target_window_tokens)
 
@@ -210,12 +216,11 @@ class TinyStoriesDataset(torch.utils.data.Dataset):
         return len(self.input_sequences)
     
     def __getitem__(self, idx):
-        return self.input_sequences[idx], self.target_sequences[idx]
+        return self.input_sequences[idx], self.target_sequences[idx], self.paddings_added[idx]
 
 
-def train_gpt(config, dataset: torch.utils.data.Dataset, num_batches=1, num_epochs=1, learning_rate=0.0004, weight_decay=0.1):
+def train_gpt(model, batch_size=10, num_epochs=1, learning_rate=0.0004, weight_decay=0.1):
     # Define the GPT model
-    model = GPT(config)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=learning_rate,
@@ -223,11 +228,24 @@ def train_gpt(config, dataset: torch.utils.data.Dataset, num_batches=1, num_epoc
     )
     loss_fn = CrossEntropyLoss()
 
+    context_length = model.positional_embedding.num_embeddings
+    ds = TinyStoriesDataset('/teamspace/studios/this_studio/transformers/data/TinyStoriesV2-GPT4-train.txt', context_length, tiktoken.get_encoding("gpt2"), end_story_idx=150)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True) 
+
     for epoch in range(num_epochs):
-        for input, target in dataset:
+        for input, target, paddings in dl:
             optimizer.zero_grad()
-            outputs = model(input.unsqueeze)
-            loss = loss_fn(torch.flatten(outputs, 0, 1), target)
+            outputs = model(input)
+
+            padding_tokens_removed_outputs = []
+            padding_tokens_removed_target = []
+            for i in range(batch_size):
+                padding_tokens_removed_outputs.append(outputs[i, :None if paddings[i] == 0 else -paddings[i], :])
+                padding_tokens_removed_target.append(target[i, :None if paddings[i] == 0 else -paddings[i]])
+
+            padding_tokens_removed_outputs = torch.stack(padding_tokens_removed_outputs, dim=0)
+            padding_tokens_removed_target = torch.stack(padding_tokens_removed_target, dim=0)
+            loss = loss_fn(torch.flatten(padding_tokens_removed_outputs, 0, 1), torch.flatten(padding_tokens_removed_target, 0, 1))
             loss.backward()
             optimizer.step()
             
