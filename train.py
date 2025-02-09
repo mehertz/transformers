@@ -4,6 +4,9 @@ import math
 import tiktoken
 import argparse
 
+import torch.utils
+import torch.utils.data
+
 
 class SelfAttention(nn.Module):
     def __init__(self, masked, context_length, emb_dim, n_heads, qkv_bias, drop_rate):
@@ -42,6 +45,9 @@ class SelfAttention(nn.Module):
 
         if self.masked:
             attn_scores.masked_fill_(self.mask[:tokens, :tokens], -float('inf'))
+
+        if padding_masks is not None:
+            attn_scores = attn_scores.masked_fill_(~padding_masks.unsqueeze(1), -float('inf'))
 
         attn_weights = self.dropout(torch.softmax(attn_scores, dim=3)) @ Vs
 
@@ -90,11 +96,11 @@ class Transformer(nn.Module):
 
         self.dropout_2 = nn.Dropout(drop_rate)
 
-    def forward(self, x):
+    def forward(self, x, padding_masks=None):
         orig = x
 
         x = self.ln_1(x)
-        x = self.attention(x)
+        x = self.attention(x, padding_masks=padding_masks)
         x = self.dropout_1(x)
 
         x = x + orig
@@ -110,6 +116,19 @@ class Transformer(nn.Module):
         return x
 
 
+class TransformerStack(nn.Module):
+    def __init__(self, n_layers, **transformer_kwargs):
+        super(TransformerStack, self).__init__()
+
+        self.layers = nn.ModuleList([Transformer(**transformer_kwargs) for _ in range(n_layers)])
+
+    def forward(self, x, padding_masks=None):
+        for layer in self.layers:
+            x = layer(x, padding_masks)
+
+        return x
+
+
 class GPT(nn.Module):
     def __init__(self, vocab_size, context_length, emb_dim, ff_int_dim_mult, n_heads, n_layers, drop_rate, qkv_bias):
         super(GPT, self).__init__()
@@ -118,24 +137,20 @@ class GPT(nn.Module):
         self.positional_embedding = nn.Embedding(context_length, emb_dim)
         self.dropout = nn.Dropout(drop_rate)
         
-        self.transformers = nn.Sequential(
-            *[
-                Transformer(
-                    context_length=context_length, 
-                    emb_dim=emb_dim, 
-                    ff_int_dim_mult=ff_int_dim_mult, 
-                    n_heads=n_heads, 
-                    drop_rate=drop_rate,
-                    qkv_bias=qkv_bias
-                ) 
-                for _ in range(n_layers)
-            ]
+        self.transformers = TransformerStack(
+            n_layers,
+            context_length=context_length, 
+            emb_dim=emb_dim, 
+            ff_int_dim_mult=ff_int_dim_mult, 
+            n_heads=n_heads, 
+            drop_rate=drop_rate,
+            qkv_bias=qkv_bias
         )
 
         self.ln = nn.LayerNorm(emb_dim)
         self.output = nn.Linear(emb_dim, vocab_size, bias=False)
 
-    def forward(self, x):
+    def forward(self, x, padding_masks=None):
         batches, context_length = x.shape
 
         token_embeddings = self.embedding(x)
@@ -144,24 +159,17 @@ class GPT(nn.Module):
         embeddings = token_embeddings + positional_embeddings
 
         x = self.dropout(embeddings)
-        x = self.transformers(x)
+        x = self.transformers(x, padding_masks=padding_masks)
         x = self.ln(x)
         
         return self.output(x)
 
 
 class CrossEntropyLoss(nn.Module):
-    super().__init__()
-
     def forward(self, input_logits, target_idxs):
         # input logits: minibatch x vocab
         # target idxs: minibatch
-        # input_probs = torch.nn.functional.softmax(input_logits, dim=1)
-        # target_probs = input_probs[torch.arange(len(input_probs)), target_idxs]
-
-        # return torch.mean(torch.sum(torch.log(target_probs))) * -1
-
-        # --- Alright Claude, let's use log_softmax and gather as you describe!
+        # padding_masks: minibatch x context_size
 
         target_probs = nn.functional.log_softmax(input_logits, dim=1)
         target_probs = torch.gather(target_probs, dim=1, index=torch.unsqueeze(target_idxs, 1)).squeeze(1)
@@ -169,9 +177,61 @@ class CrossEntropyLoss(nn.Module):
         return torch.mean(target_probs)
 
 
-def train_gpt(config):
+class TinyStoriesDataset(torch.utils.data.Dataset):
+    def __init__(self, path: str, max_length: int, tokenizer, start_story_idx: int = 0, end_story_idx: int = None):
+        self.max_length = max_length
+        self.input_sequences = []
+        self.target_sequences = []
+        
+        # Read and split the file into stories
+        with open(path, 'r') as f:
+            text = f.read()
+        stories = text.split('<|endoftext|>')[start_story_idx:len(stories) if end_story_idx is None else end_story_idx]
+        
+        _eos_token = torch.tensor(tokenizer.encode('<|endoftext|>', allowed_special={'<|endoftext|>'}))
+
+        for story in stories:
+            tokens = tokenizer.encode(story.strip())
+
+            for start_idx in range(0, max((len(tokens) - max_length) + 1, 1), max_length):
+                self.input_sequences.append(torch.tensor(tokens[start_idx : start_idx + max_length]))
+
+                _target_window_start = start_idx + 1
+                _target_window_end = _target_window_start + max_length
+
+                _target_window = torch.tensor(tokens[_target_window_start:_target_window_end])
+                _is_end_of_sequence = len(_target_window) < max_length
+
+                _target_window_tokens = _target_window if not _is_end_of_sequence else torch.cat([_target_window, _eos_token])
+
+                self.target_sequences.append(_target_window_tokens)
+
+    def __len__(self):
+        return len(self.input_sequences)
+    
+    def __getitem__(self, idx):
+        return self.input_sequences[idx], self.target_sequences[idx]
+
+
+def train_gpt(config, dataset: torch.utils.data.Dataset, num_batches=1, num_epochs=1, learning_rate=0.0004, weight_decay=0.1):
     # Define the GPT model
     model = GPT(config)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay
+    )
+    loss_fn = CrossEntropyLoss()
+
+    for epoch in range(num_epochs):
+        for input, target in dataset:
+            optimizer.zero_grad()
+            outputs = model(input.unsqueeze)
+            loss = loss_fn(torch.flatten(outputs, 0, 1), target)
+            loss.backward()
+            optimizer.step()
+            
+            print(loss)
 
 
 def inference(gpt: GPT, text: str, max_tokens_out: int):
