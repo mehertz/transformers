@@ -30,7 +30,7 @@ class SelfAttention(nn.Module):
             torch.triu(torch.ones(context_length, context_length), diagonal=1).bool()
         )
 
-    def forward(self, x):
+    def forward(self, x, padding_masks=None):
         Q = self.q_mat(x)
         K = self.k_mat(x)
         V = self.v_mat(x)
