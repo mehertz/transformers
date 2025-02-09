@@ -177,7 +177,7 @@ class CrossEntropyLoss(nn.Module):
 
 
 class TinyStoriesDataset(torch.utils.data.Dataset):
-    def __init__(self, path: str, max_length: int, tokenizer, start_story_idx: int = 0, end_story_idx: int = None, padding_token=-100):
+    def __init__(self, path: str, max_length: int, tokenizer, start_story_idx: int = 0, end_story_idx: int = None, padding_token=1):
         self.max_length = max_length
         self.input_sequences = []
         self.target_sequences = []
@@ -243,9 +243,9 @@ def train_gpt(model, batch_size=10, num_epochs=1, learning_rate=0.0004, weight_d
                 padding_tokens_removed_outputs.append(outputs[i, :None if paddings[i] == 0 else -paddings[i], :])
                 padding_tokens_removed_target.append(target[i, :None if paddings[i] == 0 else -paddings[i]])
 
-            padding_tokens_removed_outputs = torch.stack(padding_tokens_removed_outputs, dim=0)
-            padding_tokens_removed_target = torch.stack(padding_tokens_removed_target, dim=0)
-            loss = loss_fn(torch.flatten(padding_tokens_removed_outputs, 0, 1), torch.flatten(padding_tokens_removed_target, 0, 1))
+            padding_tokens_removed_outputs = torch.cat(padding_tokens_removed_outputs)
+            padding_tokens_removed_target = torch.cat(padding_tokens_removed_target)
+            loss = loss_fn(padding_tokens_removed_outputs, padding_tokens_removed_target)
             loss.backward()
             optimizer.step()
             
@@ -262,9 +262,6 @@ def inference(gpt: GPT, text: str, max_tokens_out: int):
             logits = gpt(tokens)
 
             idx = torch.argmax(logits[:, -1, :])
-            # sofmaxed = torch.nn.functional.softmax(logits)
-            # _, idx = torch.max(sofmaxed)
-
             tokens = torch.cat((tokens, torch.tensor([idx]).unsqueeze(0)), dim=1)
 
     return tokenizer.decode(tokens[0].tolist())
