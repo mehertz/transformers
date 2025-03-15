@@ -12,20 +12,24 @@ from torch.utils.data import DataLoader
 
 def compute_rope_angles(head_dim, theta_base, context_length):
     # RoPE is... non-trivial
-    # It computes a rotation for dimension-pairs of an input key
+    # It takes the input key, all the dimensions of the input key, and pairs one dimension up 
+    # with another such that you reduce it to head_dim/2 number of 2D pairs.
+    # 
     # Each input key is expected to come from an attention head
-    # And each dimension pair is effectively (ABAB)
-    # So we take an input key and basically just pair up the dimensions into head_dim/2 pairs
+    # And we split all the dimensions of the key into pairs such that dim 0 is paired with dim N/2 - 
+    # effectively (ABCABC)
     #
     # The rotation itself is applied as if we're rotating a complex number
     # To rotate a complex number (z = a + bi), you can multiply it by (cos(angle) + i*sin(angle))
-    # So effectively we're doing (a + bi)(cos(angle) + i·sin(angle)
+    # So effectively we're doing (a + bi)(cos(angle) + i·sin(angle))
     # a and b are the two "paired" values (AA, BB)
     # The only additional trick is rather than multiplying the pairs by angle, we multiply by 
-    # m*angle, where m is simply the token position
+    # m*angle, where m is the token position.
     # 
-    # The key here is that we can pre-compute the rotation frequencies 
-    # for each pair up-front
+    # The key here is that we can pre-compute the cos and sin for the rotation frequencies for each 2D
+    # pair up-front. The rotation frequency for each 2D pair is defined as theta_base^(-2i/head_dim) 
+    # where i is the index of that 2D pair. We then multiply that dimension-pair angle by the token 
+    # index to imbue with positional information which.
 
     dim_rotation_frequencies = theta_base ** (-2*(torch.arange(0, head_dim / 2) / head_dim))
 
@@ -42,6 +46,27 @@ def compute_rope_angles(head_dim, theta_base, context_length):
 
     return torch.cos(angles), torch.sin(angles)
 
+
+def rope(x, precomputed_cos, precomputed_sin):
+    # x [batch, heads, sequence, head_dim]
+
+    batch_size, num_heads, seq_len, head_dim = x.shape
+
+    lhs_of_paired_dims = x[:, :, :, :head_dim // 2]
+    rhs_of_pairsed_dims = x[:, :, :, head_dim // 2:]
+
+    # Right, rotation of a complex number (a + bi) by (angle) = 
+    # (a + bi)(cos(angle) + i·sin(angle)) =
+    # (a·cos(angle) - b·sin(angle)) + i(a·sin(angle) + b·cos(angle))
+    # (note the minus due to i being squared)
+    # so for cos, we want to multiply the angle by everything (both parts)
+    # but for sin, we want the rhs to be negative
+
+    # and remember
+    sine_part = torch.cat((-rhs_of_pairsed_dims, lhs_of_paired_dims), dim=-1) * precomputed_sin
+    cosine_part = precomputed_cos * x  
+
+    return (cosine_part + sine_part).to(dtype=x.dtype)
 
 
 class SelfAttention(nn.Module):
