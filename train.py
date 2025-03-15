@@ -55,6 +55,9 @@ def rope(x, precomputed_cos, precomputed_sin):
     lhs_of_paired_dims = x[:, :, :, :head_dim // 2]
     rhs_of_pairsed_dims = x[:, :, :, head_dim // 2:]
 
+    cos = cos[:seq_len, :].unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, head_dim]
+    sin = sin[:seq_len, :].unsqueeze(0).unsqueeze(0)
+
     # Right, rotation of a complex number (a + bi) by (angle) = 
     # (a + bi)(cos(angle) + i·sin(angle)) =
     # (a·cos(angle) - b·sin(angle)) + i(a·sin(angle) + b·cos(angle))
@@ -62,9 +65,8 @@ def rope(x, precomputed_cos, precomputed_sin):
     # so for cos, we want to multiply the angle by everything (both parts)
     # but for sin, we want the rhs to be negative
 
-    # and remember
-    sine_part = torch.cat((-rhs_of_pairsed_dims, lhs_of_paired_dims), dim=-1) * precomputed_sin
-    cosine_part = precomputed_cos * x  
+    sine_part = torch.cat((-rhs_of_pairsed_dims, lhs_of_paired_dims), dim=-1) * sin
+    cosine_part = cos * x  
 
     return (cosine_part + sine_part).to(dtype=x.dtype)
 
