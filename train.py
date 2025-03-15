@@ -173,7 +173,7 @@ class CrossEntropyLoss(nn.Module):
         target_probs = nn.functional.log_softmax(input_logits, dim=1)
         target_probs = torch.gather(target_probs, dim=1, index=torch.unsqueeze(target_idxs, 1)).squeeze(1)
 
-        return torch.mean(target_probs)
+        return -torch.mean(target_probs)
 
 
 class TinyStoriesDataset(torch.utils.data.Dataset):
@@ -220,7 +220,6 @@ class TinyStoriesDataset(torch.utils.data.Dataset):
 
 
 def train_gpt(model, batch_size=10, num_epochs=1, learning_rate=0.0004, weight_decay=0.1):
-    # Define the GPT model
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=learning_rate,
