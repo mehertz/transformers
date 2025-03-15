@@ -10,6 +10,40 @@ import torch.utils.data
 from torch.utils.data import DataLoader
 
 
+def compute_rope_angles(head_dim, theta_base, context_length):
+    # RoPE is... non-trivial
+    # It computes a rotation for dimension-pairs of an input key
+    # Each input key is expected to come from an attention head
+    # And each dimension pair is effectively (ABAB)
+    # So we take an input key and basically just pair up the dimensions into head_dim/2 pairs
+    #
+    # The rotation itself is applied as if we're rotating a complex number
+    # To rotate a complex number (z = a + bi), you can multiply it by (cos(angle) + i*sin(angle))
+    # So effectively we're doing (a + bi)(cos(angle) + i·sin(angle)
+    # a and b are the two "paired" values (AA, BB)
+    # The only additional trick is rather than multiplying the pairs by angle, we multiply by 
+    # m*angle, where m is simply the token position
+    # 
+    # The key here is that we can pre-compute the rotation frequencies 
+    # for each pair up-front
+
+    dim_rotation_frequencies = theta_base ** (-2*(torch.arange(0, head_dim / 2) / head_dim))
+
+    positions = torch.arange(context_length)
+
+    # We want to multiply the rotation frequences ([head_dim/2]) by all possible positions
+    # And get a [context_length, head_dim] matrix where row0 is dim_rotation_frequencies * 0
+    # and row1 is dim_rotation_frequencies * 1, and row2 is....
+
+    positions = positions[:, None]  # [context_length, 1] (i.e. [[0], [1], [2]...])
+    dim_rotation_frequencies = dim_rotation_frequencies.unsqueeze(0)  # [1, head_dim/2]
+    angles = positions * dim_rotation_frequencies # [context_length, head_dim/2]
+    angles = torch.cat([angles, angles], dim=1)  # [context_length, head_dim]
+
+    return torch.cos(angles), torch.sin(angles)
+
+
+
 class SelfAttention(nn.Module):
     def __init__(self, masked, context_length, emb_dim, n_heads, qkv_bias, drop_rate):
         super(SelfAttention, self).__init__()
