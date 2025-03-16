@@ -48,15 +48,15 @@ def compute_rope_angles(head_dim, theta_base, context_length):
 
 
 def rope(x, precomputed_cos, precomputed_sin):
-    # x [batch, heads, sequence, head_dim]
+    # x [batch, heads, tokens, head_dim]
 
-    batch_size, num_heads, seq_len, head_dim = x.shape
+    _batch_size, _num_heads, seq_len, head_dim = x.shape
 
     lhs_of_paired_dims = x[:, :, :, :head_dim // 2]
     rhs_of_pairsed_dims = x[:, :, :, head_dim // 2:]
 
-    cos = cos[:seq_len, :].unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, head_dim]
-    sin = sin[:seq_len, :].unsqueeze(0).unsqueeze(0)
+    cos = precomputed_cos[:seq_len, :].unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, head_dim]
+    sin = precomputed_sin[:seq_len, :].unsqueeze(0).unsqueeze(0)
 
     # Right, rotation of a complex number (a + bi) by (angle) = 
     # (a + bi)(cos(angle) + i·sin(angle)) =
@@ -72,7 +72,7 @@ def rope(x, precomputed_cos, precomputed_sin):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, masked, context_length, emb_dim, n_heads, qkv_bias, drop_rate):
+    def __init__(self, masked, context_length, emb_dim, n_heads, drop_rate, rope_rot_vals):
         super(SelfAttention, self).__init__()
 
         self.n_heads = n_heads
@@ -80,18 +80,29 @@ class SelfAttention(nn.Module):
         self.emb_dim = emb_dim
         self.masked = masked
 
-        self.q_mat = nn.Linear(emb_dim, emb_dim, bias=qkv_bias)
-        self.k_mat = nn.Linear(emb_dim, emb_dim, bias=qkv_bias)
-        self.v_mat = nn.Linear(emb_dim, emb_dim, bias=qkv_bias)
+        self.q_mat = nn.Linear(emb_dim, emb_dim, bias=False)
+        self.k_mat = nn.Linear(emb_dim, emb_dim, bias=False)
+        self.v_mat = nn.Linear(emb_dim, emb_dim, bias=False)
 
-        self.out = nn.Linear(emb_dim, emb_dim)
+        self.out = nn.Linear(emb_dim, emb_dim, bias=False)
 
         self.dropout = nn.Dropout(drop_rate)
+
+        self.register_buffer(
+            "rope_cos",
+            rope_rot_vals[0]
+        )
+
+        self.register_buffer(
+            "rope_sin",
+            rope_rot_vals[1]
+        )
 
         self.register_buffer(
             "mask",
             torch.triu(torch.ones(context_length, context_length), diagonal=1).bool()
         )
+
 
     def forward(self, x):
         Q = self.q_mat(x)
@@ -103,6 +114,9 @@ class SelfAttention(nn.Module):
         Qs = Q.view(batches, tokens, self.n_heads, dims // self.n_heads).transpose(1,2)
         Ks = K.view(batches, tokens, self.n_heads, dims // self.n_heads).transpose(1,2)
         Vs = V.view(batches, tokens, self.n_heads, dims // self.n_heads).transpose(1,2)
+
+        Qs = rope(Qs, self.rope_cos, self.rope_sin)
+        Ks = rope(Ks, self.rope_cos, self.rope_sin)
 
         attn_scores = (Qs @ Ks.transpose(2, 3)) / ((dims // self.n_heads) ** 0.5)
 
@@ -134,7 +148,7 @@ class MLP(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, context_length, emb_dim, ff_int_dim_mult, n_heads, drop_rate, qkv_bias):
+    def __init__(self, context_length, emb_dim, ff_int_dim_mult, n_heads, drop_rate, rope_rot_vals):
         super(Transformer, self).__init__()
 
         self.ln_1 = nn.LayerNorm(emb_dim)
@@ -145,7 +159,7 @@ class Transformer(nn.Module):
             emb_dim=emb_dim, 
             n_heads=n_heads, 
             drop_rate=drop_rate,
-            qkv_bias=qkv_bias
+            rope_rot_vals=rope_rot_vals
         )
 
         self.dropout_1 = nn.Dropout(drop_rate)
@@ -180,7 +194,12 @@ class TransformerStack(nn.Module):
     def __init__(self, n_layers, **transformer_kwargs):
         super(TransformerStack, self).__init__()
 
-        self.layers = nn.ModuleList([Transformer(**transformer_kwargs) for _ in range(n_layers)])
+        rope_rot_vals = compute_rope_angles(transformer_kwargs["emb_dim"] // transformer_kwargs["n_heads"], 10_000, transformer_kwargs["context_length"])
+
+        # Todo: Register the rope_rot_values buffer with this module, and then pass through in the forward implementation.
+        # Otherwise, computing here and registering in the MHA implementation means there's no memory saving on model saving
+        # and then loading as when loading from disk the rope angles will be stored separately amongst all MHA modules
+        self.layers = nn.ModuleList([Transformer(**transformer_kwargs, rope_rot_vals=rope_rot_vals) for _ in range(n_layers)])
 
     def forward(self, x):
         for layer in self.layers:
@@ -190,12 +209,12 @@ class TransformerStack(nn.Module):
 
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size, context_length, emb_dim, ff_int_dim_mult, n_heads, n_layers, drop_rate, qkv_bias):
+    def __init__(self, vocab_size, context_length, emb_dim, ff_int_dim_mult, n_heads, n_layers, drop_rate):
         super(GPT, self).__init__()
 
         self.embedding = nn.Embedding(num_embeddings=vocab_size, embedding_dim=emb_dim)
-        self.positional_embedding = nn.Embedding(context_length, emb_dim)
         self.dropout = nn.Dropout(drop_rate)
+        self.register_buffer("context_length", torch.tensor(context_length, dtype=torch.int64))
         
         self.transformers = TransformerStack(
             n_layers,
@@ -204,21 +223,13 @@ class GPT(nn.Module):
             ff_int_dim_mult=ff_int_dim_mult, 
             n_heads=n_heads, 
             drop_rate=drop_rate,
-            qkv_bias=qkv_bias
         )
 
         self.ln = nn.LayerNorm(emb_dim)
         self.output = nn.Linear(emb_dim, vocab_size, bias=False)
 
     def forward(self, x):
-        batches, context_length = x.shape
-
-        token_embeddings = self.embedding(x)
-        positional_embeddings = self.positional_embedding(torch.arange(context_length))
-
-        embeddings = token_embeddings + positional_embeddings
-
-        x = self.dropout(embeddings)
+        x = self.dropout(self.embedding(x))
         x = self.transformers(x)
         x = self.ln(x)
         
@@ -288,7 +299,7 @@ def train_gpt(model, batch_size=10, num_epochs=1, learning_rate=0.0004, weight_d
     )
     loss_fn = CrossEntropyLoss()
 
-    context_length = model.positional_embedding.num_embeddings
+    context_length = int(model.context_length)
     ds = TinyStoriesDataset('/teamspace/studios/this_studio/transformers/data/TinyStoriesV2-GPT4-train.txt', context_length, tiktoken.get_encoding("gpt2"), end_story_idx=150)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True) 
 
@@ -333,7 +344,6 @@ if __name__ == "__main__":
         context_length=4,
         emb_dim=12,
         n_heads=2,
-        qkv_bias=False,
         drop_rate=0.1
     )
     sa.forward(torch.rand(1, 4, 12))
@@ -346,7 +356,6 @@ if __name__ == "__main__":
     parser.add_argument("--n_heads", type=int, default=12, help="Number of attention heads")
     parser.add_argument("--n_layers", type=int, default=12, help="Number of layers")
     parser.add_argument("--drop_rate", type=float, default=0.1, help="Dropout rate")
-    parser.add_argument("--qkv_bias", type=bool, default=False, help="Query-Key-Value bias")
     args = parser.parse_args()
 
     # Define the GPT configuration using the parsed arguments
@@ -358,7 +367,6 @@ if __name__ == "__main__":
         "n_heads": args.n_heads,
         "n_layers": args.n_layers,
         "drop_rate": args.drop_rate,
-        "qkv_bias": args.qkv_bias
     }
 
     train_gpt(GPT_CONFIG)
