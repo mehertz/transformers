@@ -1,15 +1,14 @@
 import torch
 import torch.nn as nn
-import math
-import pandas as pd
+import yaml
 import tiktoken
-import argparse
+from pydantic import BaseModel, Field
+from typing import Optional
+from torch.utils.data import DataLoader
 import click
 
 import torch.utils
 import torch.utils.data
-
-from torch.utils.data import DataLoader
 
 
 class SelfAttention(nn.Module):
@@ -310,29 +309,46 @@ class TinyStoriesDataset(torch.utils.data.IterableDataset):
                     yield final_story.strip()
 
 
-def _train(model, batch_size=10, num_epochs=1, learning_rate=0.0004, weight_decay=0.1):
+def _train(ModelConfig, OptimizerConfig, TrainingConfig):
+    model = MattGPT(
+        vocab_size=ModelConfig.vocab_size,
+        context_length=ModelConfig.context_length,
+        emb_dim=ModelConfig.emb_dim,
+        ff_int_dim_mult=ModelConfig.ff_int_dim_mult,
+        n_heads=ModelConfig.n_heads,
+        n_layers=ModelConfig.n_layers,
+        drop_rate=ModelConfig.drop_rate
+    )
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=learning_rate,
-        weight_decay=weight_decay
+        lr = OptimizerConfig.learning_rate,
+        weight_decay = OptimizerConfig.weight_decay
+    )
+
+    dataloader = DataLoader(
+        TinyStoriesDataset(
+            TrainingConfig.train_filepath,
+            ModelConfig.context_length,
+            tiktoken.get_encoding("gpt2"),
+            padding_token=1
+        ),
+        batch_size=TrainingConfig.batch_size
     )
     loss_fn = CrossEntropyLoss()
 
-    context_length = int(model.context_length)
-    ds = TinyStoriesDataset('/teamspace/studios/this_studio/transformers/data/TinyStoriesV2-GPT4-train.txt', context_length, tiktoken.get_encoding("gpt2"), end_story_idx=150)
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=True) 
-
-    for epoch in range(num_epochs):
-        for input, target, paddings in dl:
+    for epoch in range(TrainingConfig.num_epochs):
+        for input, target, paddings in dataloader:
             optimizer.zero_grad()
             outputs = model(input)
 
             padding_tokens_removed_outputs = []
             padding_tokens_removed_target = []
-            for i in range(batch_size):
+            for i in range(TrainingConfig.batch_size):
                 padding_tokens_removed_outputs.append(outputs[i, :None if paddings[i] == 0 else -paddings[i], :])
                 padding_tokens_removed_target.append(target[i, :None if paddings[i] == 0 else -paddings[i]])
 
+            import ipdb; ipdb.set_trace()
             padding_tokens_removed_outputs = torch.cat(padding_tokens_removed_outputs)
             padding_tokens_removed_target = torch.cat(padding_tokens_removed_target)
             loss = loss_fn(padding_tokens_removed_outputs, padding_tokens_removed_target)
@@ -357,63 +373,53 @@ def _inference(gpt: MattGPT, text: str, max_tokens_out: int):
     return tokenizer.decode(tokens[0].tolist())
 
 
+class ModelConfig(BaseModel):
+    vocab_size: int = Field(default=50257, description="Vocabulary size")
+    context_length: int = Field(default=1024, description="Context length")
+    emb_dim: int = Field(default=768, description="Embedding dimension")
+    ff_int_dim_mult: int = Field(default=4, description="Factor increase of embedding dimension for linear layers")
+    n_heads: int = Field(default=12, description="Number of attention heads")
+    n_layers: int = Field(default=12, description="Number of layers")
+    drop_rate: float = Field(default=0.1, description="Dropout rate")
+
+
+class OptimizerConfig(BaseModel):
+    learning_rate: float = Field(default=0.0004, description="Learning rate")
+    weight_decay: float = Field(default=0.1, description="Weight decay")
+
+
+class TrainingConfig(BaseModel):
+    train_filepath: str = Field(default="/teamspace/studios/this_studio/transformers/data/TinyStoriesV2-GPT4-train.txt", 
+                               description="Path to training data")
+    batch_size: int = Field(default=10, description="Batch size")
+    num_epochs: int = Field(default=1, description="Number of epochs")
+
+
 @click.group()
 def cli():
     """CLI tool for training and preprocessing data for GPT models."""
     pass
 
-@cli.command()
-@click.option("--vocab-size", type=int, default=50257, help="Vocabulary size")
-@click.option("--context-length", type=int, default=1024, help="Context length")
-@click.option("--emb-dim", type=int, default=768, help="Embedding dimension")
-@click.option("--ff-int-dim-mult", type=int, default=4, help="Factor increase of embedding dimension for linear layers")
-@click.option("--n-heads", type=int, default=12, help="Number of attention heads")
-@click.option("--n-layers", type=int, default=12, help="Number of layers")
-@click.option("--drop-rate", type=float, default=0.1, help="Dropout rate")
-def train(vocab_size, context_length, emb_dim, ff_int_dim_mult, n_heads, n_layers, drop_rate):
-    """Train a GPT model with the specified configuration."""
-
-    model = MattGPT(
-        vocab_size=vocab_size,
-        context_length=context_length,
-        emb_dim=emb_dim,
-        ff_int_dim_mult=ff_int_dim_mult,
-        n_heads=n_heads,
-        n_layers=n_layers,
-        drop_rate=drop_rate
-    )
-
-    _train(model)
-
 
 @cli.command()
-@click.argument("input-file", type=click.Path(exists=True))
-@click.argument("output-file", type=click.Path())
-@click.option("--tokenizer", type=str, required=True, help="Path to tokenizer or name of pre-trained tokenizer")
-@click.option("--max-length", type=int, default=1024, help="Maximum sequence length")
-def preprocess_txt(input_file, output_file, tokenizer, max_length):
+@click.option("--config", type=click.Path(exists=True), required=True, help="Path to YAML configuration file")
+def train(config):
+    """Train a GPT model with the configuration specified in a YAML file.
+    
+    Usage:
+
+    python MattGPT.py train --config config.yaml
     """
-    Preprocess text file and convert to Parquet format for efficient training.
+    # Load configuration from YAML file
+    with open(config, 'r') as file:
+        cfg = yaml.safe_load(file)
     
-    INPUT_FILE: Path to the input text file
-    OUTPUT_FILE: Path where the output Parquet file will be saved
-    """
-    from transformers import AutoTokenizer
-    
-    try:
-        # Try to load tokenizer from file or pre-trained model
-        tokenizer_obj = AutoTokenizer.from_pretrained(tokenizer)
-        click.echo(f"Loaded tokenizer: {tokenizer}")
-    except Exception as e:
-        click.echo(f"Error loading tokenizer: {e}", err=True)
-        return
-    
-    click.echo(f"Converting {input_file} to Parquet format...")
-    try:
-        from parquet_utils import convert_txt_to_parquet
-        convert_txt_to_parquet(input_file, output_file, tokenizer_obj)
-        click.echo(f"Successfully converted to {output_file}")
-    except ImportError:
-        click.echo("Please install required dependencies: pip install pandas pyarrow", err=True)
-    except Exception as e:
-        click.echo(f"Error during conversion: {e}", err=True)
+    model_cfg = ModelConfig(**cfg['model'])
+    optimizer_cfg = OptimizerConfig(**cfg['optimizer'])
+    training_cfg = TrainingConfig(**cfg['training'])
+
+    _train(model_cfg, optimizer_cfg, training_cfg)
+
+
+if __name__ == "__main__":
+    cli()

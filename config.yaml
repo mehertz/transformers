@@ -1,0 +1,17 @@
+model:
+  vocab_size: 50257
+  context_length: 128
+  emb_dim: 768
+  ff_int_dim_mult: 4
+  n_heads: 12
+  n_layers: 12
+  drop_rate: 0.1
+
+optimizer:
+  learning_rate: 0.0004
+  weight_decay: 0.1
+
+training:
+  train_filepath: "/teamspace/studios/this_studio/transformers/data/TinyStoriesV2-GPT4-train.txt"
+  batch_size: 10
+  num_epochs: 1
