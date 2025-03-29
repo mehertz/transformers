@@ -1,10 +1,12 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import yaml
 import tiktoken
 from pydantic import BaseModel, Field
 from typing import Optional
 from torch.utils.data import DataLoader
+from torchinfo import summary
 import click
 
 import torch.utils
@@ -25,8 +27,6 @@ class SelfAttention(nn.Module):
         self.v_mat = nn.Linear(emb_dim, emb_dim, bias=False)
 
         self.out = nn.Linear(emb_dim, emb_dim, bias=False)
-
-        self.dropout = nn.Dropout(drop_rate)
 
         self.register_buffer(
             "rope_cos",
@@ -63,7 +63,7 @@ class SelfAttention(nn.Module):
         if self.masked:
             attn_scores.masked_fill_(self.mask[:tokens, :tokens], -float('inf'))
 
-        attn_weights = self.dropout(torch.softmax(attn_scores, dim=3)) @ Vs
+        attn_weights = torch.softmax(attn_scores, dim=3) @ Vs
 
         context = attn_weights.transpose(1,2).contiguous().view(batches, tokens, self.emb_dim)
 
@@ -131,10 +131,26 @@ class SelfAttention(nn.Module):
         return torch.cos(angles), torch.sin(angles)
 
 
-class MLP(nn.Module):
+class LlamaFF(nn.Module):
     def __init__(self, emb_dim, ff_int_dim_mult):
-        super(MLP, self).__init__()
+        super(LlamaFF, self).__init__()
 
+        self.in_ff_1 = nn.Linear(emb_dim, emb_dim * ff_int_dim_mult)
+        self.in_ff_2 = nn.Linear(emb_dim, emb_dim * ff_int_dim_mult)
+        self.out_ff = nn.Linear(emb_dim * ff_int_dim_mult, emb_dim)
+
+    def forward(self, x):
+        x1 = self.in_ff_1(x)
+        x2 = self.in_ff_2(x)
+        x = F.silu(x1) * x2
+        return self.out_ff(x)
+
+
+class GPTFF(nn.Module):
+    def __init__(self, emb_dim, ff_int_dim_mult):
+        super(GPTFF, self).__init__()
+
+        self.in_ff = nn.Linear(emb_dim, emb_dim * ff_int_dim_mult)
         self.in_ff = nn.Linear(emb_dim, emb_dim * ff_int_dim_mult)
         self.out_ff = nn.Linear(emb_dim * ff_int_dim_mult, emb_dim)
 
@@ -148,11 +164,24 @@ class MLP(nn.Module):
         return self.layers(x)
 
 
+# Used by Llama architectures
+class RMSNorm(nn.Module):
+    def  __init__(self, emb_dim, eps=1e-5):
+        super(RMSNorm, self).__init__()
+
+        self.weights = nn.Parameter(torch.ones(emb_dim))
+        self.eps = eps
+
+    def forward(self, x):
+        rms = torch.sqrt(x.pow(2).mean(dim=-1) + self.eps).unsqueeze(-1)
+        return ((x / rms) * self.weights).to(dtype=x.dtype)
+
+
 class Transformer(nn.Module):
     def __init__(self, context_length, emb_dim, ff_int_dim_mult, n_heads, drop_rate, rope_rot_vals):
         super(Transformer, self).__init__()
 
-        self.ln_1 = nn.LayerNorm(emb_dim)
+        self.rms_1 = RMSNorm(emb_dim)
 
         self.attention = SelfAttention(
             masked=True,
@@ -163,28 +192,23 @@ class Transformer(nn.Module):
             rope_rot_vals=rope_rot_vals
         )
 
-        self.dropout_1 = nn.Dropout(drop_rate)
+        self.rms_2 = RMSNorm(emb_dim)
 
-        self.ln_2 = nn.LayerNorm(emb_dim)
+        self.FF = LlamaFF(emb_dim, ff_int_dim_mult)
 
-        self.MLP = MLP(emb_dim, ff_int_dim_mult)
-
-        self.dropout_2 = nn.Dropout(drop_rate)
 
     def forward(self, x):
         orig = x
 
-        x = self.ln_1(x)
+        x = self.rms_1(x)
         x = self.attention(x)
-        x = self.dropout_1(x)
 
         x = x + orig
 
         orig = x
 
-        x = self.ln_2(x)
-        x = self.MLP(x)
-        x = self.dropout_2(x)
+        x = self.rms_2(x)
+        x = self.FF(x)
 
         x = x + orig
 
@@ -208,12 +232,12 @@ class TransformerStack(nn.Module):
 
         return x
 
+
 class MattGPT(nn.Module):
     def __init__(self, vocab_size, context_length, emb_dim, ff_int_dim_mult, n_heads, n_layers, drop_rate):
         super(MattGPT, self).__init__()
 
         self.embedding = nn.Embedding(num_embeddings=vocab_size, embedding_dim=emb_dim)
-        self.dropout = nn.Dropout(drop_rate)
         self.register_buffer("context_length", torch.tensor(context_length, dtype=torch.int64))
         
         self.transformers = TransformerStack(
@@ -229,7 +253,7 @@ class MattGPT(nn.Module):
         self.output = nn.Linear(emb_dim, vocab_size, bias=False)
 
     def forward(self, x):
-        x = self.dropout(self.embedding(x))
+        x = self.embedding(x)
         x = self.transformers(x)
         x = self.ln(x)
         
@@ -320,6 +344,8 @@ def _train(ModelConfig, OptimizerConfig, TrainingConfig):
         drop_rate=ModelConfig.drop_rate
     )
 
+    print(summary(model))
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr = OptimizerConfig.learning_rate,
@@ -348,7 +374,6 @@ def _train(ModelConfig, OptimizerConfig, TrainingConfig):
                 padding_tokens_removed_outputs.append(outputs[i, :None if paddings[i] == 0 else -paddings[i], :])
                 padding_tokens_removed_target.append(target[i, :None if paddings[i] == 0 else -paddings[i]])
 
-            import ipdb; ipdb.set_trace()
             padding_tokens_removed_outputs = torch.cat(padding_tokens_removed_outputs)
             padding_tokens_removed_target = torch.cat(padding_tokens_removed_target)
             loss = loss_fn(padding_tokens_removed_outputs, padding_tokens_removed_target)
